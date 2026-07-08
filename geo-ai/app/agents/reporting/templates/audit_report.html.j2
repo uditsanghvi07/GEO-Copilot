@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GEO Audit Report — {{ product_name }}</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; max-width: 900px; margin: 0 auto; padding: 2rem; color: #1a1a2e; line-height: 1.6; }
+    h1 { color: #16213e; border-bottom: 3px solid #0f3460; padding-bottom: 0.5rem; }
+    h2 { color: #0f3460; margin-top: 2rem; }
+    .score-badge { display: inline-block; font-size: 2.5rem; font-weight: bold; color: #e94560; background: #f8f9fa; padding: 0.5rem 1.5rem; border-radius: 8px; }
+    .breakdown table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+    .breakdown th, .breakdown td { border: 1px solid #dee2e6; padding: 0.5rem 1rem; text-align: left; }
+    .breakdown th { background: #0f3460; color: white; }
+    .unavailable { color: #6c757d; font-style: italic; }
+    .content-preview { background: #f8f9fa; padding: 1rem; border-radius: 6px; margin: 0.5rem 0; white-space: pre-wrap; font-size: 0.9rem; max-height: 200px; overflow: hidden; }
+    .meta { color: #6c757d; font-size: 0.85rem; }
+    ul { padding-left: 1.5rem; }
+    li { margin: 0.25rem 0; }
+  </style>
+</head>
+<body>
+  <h1>GEO Audit Report</h1>
+  <p class="meta">Product: <strong>{{ product_name }}</strong> | Generated: {{ generated_at }}</p>
+
+  <h2>GEO Score</h2>
+  {% if geo_score is not none %}
+  <p class="score-badge">{{ geo_score }} / 100</p>
+  <div class="breakdown">
+    <table>
+      <tr><th>Component</th><th>Earned</th><th>Max</th><th>Details</th></tr>
+      {% for key, comp in score_breakdown.items() if key != 'total' %}
+      <tr>
+        <td>{{ key | replace('_', ' ') | title }}</td>
+        <td>{{ comp.earned }}</td>
+        <td>{{ comp.max_points }}</td>
+        <td>{{ comp.details }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% else %}
+  <p class="unavailable">GEO score not available — audit stage may have failed.</p>
+  {% endif %}
+
+  <h2>Action Plan</h2>
+  {% if action_plan %}
+  <ol>
+    {% for step in action_plan %}
+    <li><strong>{{ step.step }}</strong> — improves <em>{{ step.component }}</em> (~{{ step.estimated_point_impact }} pts)</li>
+    {% endfor %}
+  </ol>
+  {% else %}
+  <p class="unavailable">Action plan not available.</p>
+  {% endif %}
+
+  <h2>Review Intelligence Highlights</h2>
+  {% if review_summary %}
+  <p><strong>Sentiment score:</strong> {{ review_summary.overall_sentiment_score }}</p>
+  <h3>Top Complaints</h3>
+  <ul>{% for c in review_summary.top_complaints %}<li>{{ c }}</li>{% endfor %}</ul>
+  <h3>Feature Requests</h3>
+  <ul>{% for f in review_summary.top_feature_requests %}<li>{{ f }}</li>{% endfor %}</ul>
+  <h3>Positive Themes</h3>
+  <ul>{% for t in review_summary.positive_themes %}<li>{{ t }}</li>{% endfor %}</ul>
+  <h3>Negative Themes</h3>
+  <ul>{% for t in review_summary.negative_themes %}<li>{{ t }}</li>{% endfor %}</ul>
+  {% else %}
+  <p class="unavailable">Review summary not available — review intelligence stage may have been skipped or failed.</p>
+  {% endif %}
+
+  <h2>Competitor Comparison</h2>
+  {% if comparison %}
+  <p>{{ comparison.narrative_summary }}</p>
+  <h3>Missing Features</h3>
+  <ul>{% for f in comparison.missing_features %}<li>{{ f }}</li>{% endfor %}</ul>
+  <h3>Missing FAQs</h3>
+  <ul>{% for f in comparison.missing_faqs %}<li>{{ f }}</li>{% endfor %}</ul>
+  <h3>Improvement Plan</h3>
+  <ul>{% for p in comparison.improvement_plan %}<li>{{ p }}</li>{% endfor %}</ul>
+  {% else %}
+  <p class="unavailable">Competitor comparison not available — no competitor URLs were provided or comparison failed.</p>
+  {% endif %}
+
+  <h2>Generated Content</h2>
+  {% if generated_content %}
+  {% for item in generated_content %}
+  <h3>{{ item.content_type | replace('_', ' ') | title }}</h3>
+  <div class="content-preview">{{ item.preview }}</div>
+  {% endfor %}
+  {% else %}
+  <p class="unavailable">No generated content available.</p>
+  {% endif %}
+
+  <hr>
+  <p class="meta">AI GEO Copilot — Enterprise AI Discoverability Platform</p>
+</body>
+</html>

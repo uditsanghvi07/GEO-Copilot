@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+.env
+geo.db
+*.db
+chroma/*
+!chroma/.gitkeep
+logs/*
+!logs/.gitkeep
+reports/*
+!reports/.gitkeep
+uploads/*
+!uploads/.gitkeep
+.pytest_cache/
+.mypy_cache/
+*.egg-info/

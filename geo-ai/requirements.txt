@@ -1,0 +1,46 @@
+# Web framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+
+# Database
+sqlalchemy>=2.0.35
+
+# Validation / config
+pydantic[email]>=2.9.0
+pydantic-settings>=2.5.0
+python-dotenv>=1.0.1
+
+# Logging
+loguru>=0.7.2
+
+# Web crawling
+playwright>=1.47.0
+beautifulsoup4>=4.12.3
+
+# Play Store data
+google-play-scraper>=1.2.7
+
+# RAG / vector store / embeddings
+llama-index>=0.11.0
+llama-index-vector-stores-chroma>=0.2.0
+llama-index-embeddings-huggingface>=0.3.0
+chromadb>=0.5.5
+sentence-transformers>=3.1.1
+
+# Scheduling
+apscheduler>=3.10.4
+
+# Reporting
+jinja2>=3.1.4
+
+# Auth
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+# Pinned: passlib 1.7.4's bcrypt backend self-test crashes against bcrypt>=4.1
+# (stricter 72-byte secret handling). Keep pinned until passlib is updated/replaced.
+bcrypt==4.0.1
+
+# Testing
+pytest>=8.3.3
+pytest-asyncio>=0.24.0
+httpx>=0.27.2
