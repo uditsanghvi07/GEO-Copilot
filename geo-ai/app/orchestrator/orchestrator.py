@@ -15,6 +15,7 @@ from app.agents.playstore.agent import PlayStoreAnalyzerAgent
 from app.agents.reporting.agent import ReportingAgent
 from app.agents.reviews.agent import ReviewIntelligenceAgent
 from app.database.session import SessionLocal
+from app.models.common_enums import IngestionStatus
 from app.models.generated_content import ContentType
 from app.models.pipeline_run import PipelineRun, PipelineRunStatus
 from app.models.product import Product
@@ -204,14 +205,21 @@ class Orchestrator:
     def _stage_to_dict(self, result: AgentResult) -> dict[str, Any]:
         if result.success:
             status = "success"
+            if result.data is not None and getattr(result.data, "status", None) == IngestionStatus.PARTIAL:
+                status = "partial"
         elif result.error_message and "not enough data" in (result.error_message or "").lower():
             status = "partial"
         else:
             status = "failed"
+        partial_note = None
+        if status == "partial" and result.data is not None:
+            failed_pages = getattr(result.data, "failed_pages", None) or []
+            if failed_pages:
+                partial_note = failed_pages[0].reason if hasattr(failed_pages[0], "reason") else failed_pages[0].get("reason")
         return {
             "status": status,
             "duration_ms": result.duration_ms,
-            "error_message": result.error_message,
+            "error_message": result.error_message or partial_note,
         }
 
     def _persist_stages(self, db: Session, run: PipelineRun, stage_statuses: dict) -> None:

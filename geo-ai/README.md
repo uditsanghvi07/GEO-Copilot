@@ -559,19 +559,196 @@ Each stage updates `pipeline_runs.stage_statuses` JSON so the frontend can show 
 
 ## GEO Scoring Engine
 
-**GEO Score: 0–100** — deterministic, rule-based, no LLM (auditable and reproducible).
+**GEO Score: 0–100** — deterministic, rule-based, no LLM (auditable and reproducible).  
+Implementation: `app/services/geo_scoring_service.py` · invoked by the Audit Agent after website + Play Store ingestion.
 
-| Component | Max Points | What it measures |
-|-----------|------------|------------------|
-| Documentation depth | 20 | Word count, help/docs/blog pages |
-| FAQ presence | 15 | FAQ page detected, FAQ count |
-| Metadata quality | 15 | Title, meta description quality |
-| Structured data | 15 | schema.org JSON-LD types |
-| Authority signals | 15 | Internal link graph (proxy for site structure) |
-| Review quality | 10 | Average rating, review volume |
-| Freshness | 10 | Days since last update signal |
+The score answers: *“How well can an AI system discover, understand, and recommend this product?”*  
+Each component earns **earned points** up to a **max cap**; the **total** is the rounded sum of all earned points (capped at 100).
 
-The Audit Agent computes this score, then asks the LLM for a **prioritized action plan** based on the breakdown — separating *measurement* (rules) from *recommendations* (AI).
+### Score components (7 weighted parameters)
+
+| # | Component | Max pts | What it measures |
+|---|-----------|---------|------------------|
+| 1 | **Documentation depth** | 20 | How much readable content exists (word count + help/docs/blog pages) |
+| 2 | **FAQ presence** | 15 | Whether FAQs exist and how many Q&A-style entries were found |
+| 3 | **Metadata quality** | 10 | Meta description presence and length (AI/snippet-friendly) |
+| 4 | **Structured data** | 20 | schema.org JSON-LD types (Organization, Product, FAQPage, etc.) |
+| 5 | **Authority signals** | 10 | Internal link graph — proxy for site-structure authority (no backlink API in MVP) |
+| 6 | **Review quality** | 15 | Play Store average rating + review volume |
+| 7 | **Freshness** | 10 | How recently the listing/site was updated |
+
+**Total possible:** 20 + 15 + 10 + 20 + 10 + 15 + 10 = **100**
+
+---
+
+### Where each parameter comes from
+
+| Parameter | Primary source | Fallback / notes |
+|-----------|----------------|------------------|
+| `word_count` | Website crawler (`website_data.word_count`) | Play Store description word count if no website |
+| `crawled_pages` | Website crawler (roles: `homepage`, `faq`, `blog`) | Empty if only Play Store audited |
+| `has_faq` | Website: FAQ page / FAQ schema / question headings | Play Store: `has_faq_content` flag |
+| `faq_count` | Website crawler (question headings + accordion patterns) | 0 if Play Store only |
+| `meta_description` | Website `<meta name="description">` | Play Store `short_description` |
+| `schema_types` | Website JSON-LD `@type` values | Empty if no website crawl |
+| `internal_links_count` | Website crawler (same-domain links on crawled pages) | 0 if Play Store only |
+| `avg_review_rating` | `AVG(reviews.rating)` for the product | 0 pts if no reviews |
+| `review_count` | `COUNT(reviews)` for the product | 0 pts if no reviews |
+| `days_since_update` | Play Store listing `updated` timestamp | — |
+| `last_updated_signal` | Website `<time>` tag or copyright year in footer | Partial credit if no Play Store date |
+
+At least **one successful ingestion source** (website or Play Store) is required before scoring runs.
+
+---
+
+### How each component is scored (rules)
+
+#### 1. Documentation depth (max 20)
+
+| Input | Rule | Points |
+|-------|------|--------|
+| Crawled pages include `faq`, `blog`, `help`, or `docs` | Bonus for multi-page content | **+8** |
+| `word_count` | Scales linearly: `min(12, (word_count / 2000) × 12)` | **0–12** |
+
+**Example:** 2,000+ words + FAQ page → up to **20/20**. Homepage-only with 500 words → ~**11/20**.
+
+---
+
+#### 2. FAQ presence (max 15)
+
+| Input | Rule | Points |
+|-------|------|--------|
+| `has_faq = true` | Base credit for any FAQ signal | **+6** |
+| `faq_count` | Scales: `min(9, (faq_count / 10) × 9)` | **0–9** |
+
+FAQ signals include: dedicated FAQ/help links, `FAQPage` schema, headings ending in `?`, accordion-style HTML classes.
+
+**Example:** FAQ page with 10+ entries → up to **15/15**. No FAQ detected → **0/15**.
+
+---
+
+#### 3. Metadata quality (max 10)
+
+Uses **`meta_description`** length only (title is extracted but not scored separately in v1).
+
+| Length (chars) | Points |
+|----------------|--------|
+| Missing | **0** |
+| 50–160 (optimal for snippets) | **10** |
+| &lt; 50 | Scales: `(length / 50) × 10` |
+| &gt; 160 | `max(4, 10 − (length − 160) × 0.05)` |
+
+**Example:** 120-character meta description → **10/10**. Missing meta → **0/10**.
+
+---
+
+#### 4. Structured data (max 20)
+
+Parses **schema.org JSON-LD** `@type` values from crawled HTML.
+
+| Schema `@type` | Points |
+|----------------|--------|
+| `Organization` | **+6** |
+| `Product` or `SoftwareApplication` | **+7** |
+| `FAQPage` | **+7** |
+| Other types (e.g. `WebSite`, `Article`, `BreadcrumbList`) | **+1 each**, max **+3** bonus |
+
+**Example:** Organization + Product + FAQPage → **20/20**. No JSON-LD → **0/20**.
+
+---
+
+#### 5. Authority signals (max 10)
+
+No external backlink API in MVP — uses **`internal_links_count`** as a **site-structure proxy** (more internal cross-links → richer graph for AI crawlers).
+
+| Input | Rule | Points |
+|-------|------|--------|
+| `internal_links_count` | Scales: `min(10, (links / 50) × 10)` | **0–10** |
+
+**Example:** 50+ internal links → **10/10**. 10 links → **2/10**.
+
+---
+
+#### 6. Review quality (max 15)
+
+From Play Store reviews stored in the `reviews` table.
+
+| Input | Rule | Points |
+|-------|------|--------|
+| `avg_review_rating` (0–5) | Scales: `(rating / 5) × 10` | **0–10** |
+| `review_count` | Scales: `min(5, (count / 100) × 5)` | **0–5** |
+
+**Example:** 4.8★ with 150 reviews → ~**14.5/15**. No reviews → **0/15**.
+
+---
+
+#### 7. Freshness (max 10)
+
+| Input | Rule | Points |
+|-------|------|--------|
+| `days_since_update ≤ 30` | Recently updated Play Store listing | **10** |
+| `31–90` days | | **7** |
+| `91–180` days | | **4** |
+| `> 180` days | | **1** |
+| `last_updated_signal` only (website copyright / `<time>`) | No Play Store date | **5** |
+| No signal at all | | **0** |
+
+---
+
+### Example score breakdown (API response)
+
+After `POST /audit` or a full pipeline run, `score_breakdown` looks like:
+
+```json
+{
+  "documentation_depth": {
+    "max_points": 20,
+    "earned": 14.0,
+    "details": "pages=['homepage', 'faq'], word_count=1850"
+  },
+  "faq_presence": {
+    "max_points": 15,
+    "earned": 12.3,
+    "details": "has_faq=True, faq_count=8"
+  },
+  "metadata_quality": {
+    "max_points": 10,
+    "earned": 10.0,
+    "details": "length=112 (optimal)"
+  },
+  "structured_data": {
+    "max_points": 20,
+    "earned": 13.0,
+    "details": "schema_types=['Organization', 'Product', 'WebSite']"
+  },
+  "authority_signals": {
+    "max_points": 10,
+    "earned": 6.0,
+    "details": "internal_links_count=30 (proxy for site-structure authority)"
+  },
+  "review_quality": {
+    "max_points": 15,
+    "earned": 11.5,
+    "details": "avg_rating=4.20, count=85"
+  },
+  "freshness": {
+    "max_points": 10,
+    "earned": 7.0,
+    "details": "days_since_update=45"
+  },
+  "total": 74
+}
+```
+
+### Score interpretation (rough bands)
+
+| GEO score | Meaning |
+|-----------|---------|
+| **70–100** | Healthy — AI systems can likely find and describe the product well |
+| **45–69** | Needs attention — missing FAQs, schema, metadata, or reviews |
+| **0–44** | Critical — thin content, no structured data, or no ingestion data quality |
+
+The Audit Agent computes this score, then asks the LLM for a **prioritized action plan** based on the breakdown — separating *measurement* (rules) from *recommendations* (AI). The action plan targets the **lowest-scoring components first** (e.g. “add FAQPage schema”, “expand meta description to 120 chars”, “publish a help/FAQ page”).
 
 ---
 

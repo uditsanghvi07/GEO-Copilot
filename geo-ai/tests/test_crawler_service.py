@@ -1,8 +1,18 @@
 """Smoke tests for the pure extraction/discovery functions in the Website
 Crawler service - no network or Playwright involved."""
 
-from app.agents.crawler.constants import BLOG_LINK_HINTS, FAQ_LINK_HINTS
-from app.agents.crawler.service import _discover_link, _extract_page_signals, _normalize_url
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from app.agents.crawler.constants import BLOG_LINK_HINTS, FAQ_LINK_HINTS, ROBOTS_RESTRICTED_NOTE
+from app.agents.crawler.service import (
+    _discover_link,
+    _extract_page_signals,
+    _normalize_url,
+    crawl_website,
+)
+from app.models.common_enums import IngestionStatus
 
 SAMPLE_HTML = """
 <html>
@@ -62,7 +72,37 @@ def test_normalize_url_adds_scheme():
 
 
 def test_normalize_url_rejects_empty():
-    import pytest
-
     with pytest.raises(ValueError):
         _normalize_url("   ")
+
+
+@pytest.mark.asyncio
+async def test_crawl_website_robots_blocked_uses_restricted_homepage_fetch():
+    sample_signals = _extract_page_signals(
+        """
+    <html><head><title>Netflix India</title>
+    <meta name="description" content="Watch shows online">
+    </head><body><main><h1>Unlimited movies</h1><p>Stream anywhere.</p></main></body></html>
+    """,
+        "https://www.netflix.com/in/",
+        "www.netflix.com",
+    )
+
+    async def fake_http_only(*_args, **_kwargs):
+        return {"signals": sample_signals, "snapshot_path": "/tmp/homepage.html"}
+
+    with (
+        patch("app.agents.crawler.service._build_robot_parser", new_callable=AsyncMock) as mock_robots,
+        patch("app.agents.crawler.service._can_fetch", return_value=False),
+        patch("app.agents.crawler.service._try_http_homepage_only", side_effect=fake_http_only),
+        patch("app.agents.crawler.service._check_sitemap_lastmod", new_callable=AsyncMock, return_value=None),
+    ):
+        mock_robots.return_value = object()
+        output = await crawl_website(1, "https://www.netflix.com/in/")
+
+    assert output.status == IngestionStatus.PARTIAL
+    assert output.title == "Netflix India"
+    assert output.meta_description == "Watch shows online"
+    assert output.word_count > 0
+    assert len(output.crawled_pages) == 1
+    assert output.failed_pages[0].reason == ROBOTS_RESTRICTED_NOTE

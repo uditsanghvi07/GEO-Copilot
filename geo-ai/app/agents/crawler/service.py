@@ -28,7 +28,9 @@ from app.agents.crawler.constants import (
     MAX_HEADINGS_PER_LEVEL,
     NAVIGATION_TIMEOUT_MS,
     POLITENESS_DELAY_SECONDS,
+    RESTRICTED_FETCH_USER_AGENT,
     RETRY_BASE_DELAY_SECONDS,
+    ROBOTS_RESTRICTED_NOTE,
 )
 from app.models.common_enums import IngestionStatus
 from app.models.website_data import WebsiteData
@@ -92,7 +94,15 @@ async def _load_page(context: BrowserContext, url: str) -> str:
         await page.close()
 
 
-async def _http_fetch_html(url: str) -> str:
+def _http_client_headers(user_agent: str) -> dict[str, str]:
+    return {
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+
+async def _http_fetch_html(url: str, *, user_agent: str = CRAWLER_USER_AGENT) -> str:
     """Plain HTTP GET fallback for sites that hang or block headless Chromium.
 
     Many bot-protected or HTTP/2-finicky sites still serve usable server-side
@@ -102,16 +112,109 @@ async def _http_fetch_html(url: str) -> str:
     async with httpx.AsyncClient(
         timeout=15.0,
         follow_redirects=True,
-        headers={
-            "User-Agent": CRAWLER_USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
+        headers=_http_client_headers(user_agent),
     ) as client:
         response = await client.get(url)
     if response.status_code >= 400:
         raise RuntimeError(f"HTTP {response.status_code} loading {url}")
     return response.text
+
+
+async def _fetch_restricted_homepage(
+    context: BrowserContext | None, url: str
+) -> tuple[str, str]:
+    """Best-effort homepage fetch when robots.txt blocks the bot user agent.
+
+    Tries plain HTTP GET with browser-like UAs first, then rendered Playwright
+    when a browser context is available.
+    """
+    last_exc: Exception | None = None
+    for user_agent, label in (
+        (RESTRICTED_FETCH_USER_AGENT, "HTTP restricted"),
+        (CRAWLER_USER_AGENT, "HTTP bot UA"),
+    ):
+        try:
+            html = await _http_fetch_html(url, user_agent=user_agent)
+            logger.info(f"Restricted homepage fetch succeeded via {label} for {url}")
+            return html, label
+        except Exception as exc:  # noqa: BLE001 - try next strategy
+            last_exc = exc
+            logger.debug(f"Restricted {label} fetch failed for {url}: {exc!r}")
+
+    if context is None:
+        raise RuntimeError(f"HTTP-only restricted fetch failed for {url}: {last_exc!r}")
+
+    html = await _fetch_page_html(context, url)
+    logger.info(f"Restricted homepage fetch succeeded via browser for {url}")
+    return html, "browser"
+
+
+async def _try_http_homepage_only(
+    url: str,
+    base_domain: str,
+    storage_key: str,
+    *,
+    robots_restricted: bool,
+) -> dict | None:
+    """Fetch homepage via HTTP only. Returns signal dict or None if all attempts fail."""
+    user_agents = (
+        (RESTRICTED_FETCH_USER_AGENT, "HTTP restricted"),
+        (CRAWLER_USER_AGENT, "HTTP bot UA"),
+    ) if robots_restricted else ((CRAWLER_USER_AGENT, "HTTP"),)
+
+    for user_agent, label in user_agents:
+        try:
+            html = await _http_fetch_html(url, user_agent=user_agent)
+            signals = _extract_page_signals(html, url, base_domain)
+            if not signals["title"] and signals["word_count"] < 20:
+                logger.debug(f"{label} returned thin HTML for {url}; trying next fetch strategy")
+                continue
+            snapshot_path = _save_snapshot(storage_key, "homepage", html)
+            logger.info(f"Homepage fetch succeeded via {label} for {url}")
+            return {"signals": signals, "snapshot_path": snapshot_path}
+        except Exception as exc:  # noqa: BLE001 - try next strategy
+            logger.debug(f"{label} homepage fetch failed for {url}: {exc!r}")
+    return None
+
+
+def _build_crawl_output(
+    *,
+    product_id: int,
+    crawled_pages: list[CrawledPage],
+    failed_pages: list[FailedPage],
+    aggregate: dict,
+    title: str | None,
+    meta_description: str | None,
+    last_updated_signal: str | None,
+) -> WebsiteCrawlOutput:
+    if not crawled_pages:
+        status = IngestionStatus.FAILED
+        error_message: str | None = failed_pages[0].reason if failed_pages else "All pages failed to load"
+    elif failed_pages:
+        status = IngestionStatus.PARTIAL
+        error_message = None
+    else:
+        status = IngestionStatus.SUCCESS
+        error_message = None
+
+    return WebsiteCrawlOutput(
+        product_id=product_id,
+        status=status,
+        title=title,
+        meta_description=meta_description,
+        headings_summary=aggregate["headings"],
+        has_faq=aggregate["faq_count"] > 0 or "FAQPage" in aggregate["schema_types"],
+        faq_count=aggregate["faq_count"],
+        has_schema_markup=len(aggregate["schema_types"]) > 0,
+        schema_types=sorted(aggregate["schema_types"]),
+        word_count=aggregate["word_count"],
+        internal_links_count=aggregate["internal_links_count"],
+        images_missing_alt_count=aggregate["images_missing_alt_count"],
+        last_updated_signal=last_updated_signal,
+        crawled_pages=crawled_pages,
+        failed_pages=failed_pages,
+        error_message=error_message,
+    )
 
 
 async def _fetch_page_html(context: BrowserContext, url: str) -> str:
@@ -313,6 +416,7 @@ async def crawl_website(
     base_domain = urlparse(normalized_url).netloc
     robot_parser = await _build_robot_parser(normalized_url)
     storage_key = snapshot_key or str(product_id)
+    robots_blocked_homepage = not _can_fetch(robot_parser, normalized_url)
 
     crawled_pages: list[CrawledPage] = []
     failed_pages: list[FailedPage] = []
@@ -328,6 +432,40 @@ async def crawl_website(
     meta_description: str | None = None
     last_updated_signal: str | None = None
     nav_links: list[tuple[str, str]] = []
+
+    if robots_blocked_homepage:
+        logger.info(
+            f"robots.txt restricts bot crawl for product_id={product_id}; "
+            f"attempting limited HTTP homepage fetch for {normalized_url}"
+        )
+        http_result = await _try_http_homepage_only(
+            normalized_url, base_domain, storage_key, robots_restricted=True
+        )
+        if http_result is not None:
+            signals = http_result["signals"]
+            title = signals["title"]
+            meta_description = signals["meta_description"]
+            last_updated_signal = signals["last_updated_signal"]
+            _merge_signals(aggregate, signals)
+            crawled_pages.append(
+                CrawledPage(
+                    url=normalized_url,
+                    role="homepage",
+                    snapshot_path=http_result["snapshot_path"],
+                )
+            )
+            failed_pages.append(FailedPage(url=normalized_url, reason=ROBOTS_RESTRICTED_NOTE))
+            if not last_updated_signal:
+                last_updated_signal = await _check_sitemap_lastmod(normalized_url)
+            return _build_crawl_output(
+                product_id=product_id,
+                crawled_pages=crawled_pages,
+                failed_pages=failed_pages,
+                aggregate=aggregate,
+                title=title,
+                meta_description=meta_description,
+                last_updated_signal=last_updated_signal,
+            )
 
     try:
         async with async_playwright() as pw:
@@ -347,8 +485,31 @@ async def crawl_website(
             try:
                 context = await browser.new_context(user_agent=CRAWLER_USER_AGENT)
 
-                if not _can_fetch(robot_parser, normalized_url):
-                    failed_pages.append(FailedPage(url=normalized_url, reason="disallowed by robots.txt"))
+                if robots_blocked_homepage:
+                    logger.info(
+                        f"HTTP restricted fetch missed for product_id={product_id}; "
+                        f"trying browser fallback for {normalized_url}"
+                    )
+                    try:
+                        html, _method = await _fetch_restricted_homepage(context, normalized_url)
+                        signals = _extract_page_signals(html, normalized_url, base_domain)
+                        title = signals["title"]
+                        meta_description = signals["meta_description"]
+                        last_updated_signal = signals["last_updated_signal"]
+                        nav_links = signals["nav_links"]
+                        _merge_signals(aggregate, signals)
+                        snapshot_path = _save_snapshot(storage_key, "homepage", html)
+                        crawled_pages.append(
+                            CrawledPage(url=normalized_url, role="homepage", snapshot_path=snapshot_path)
+                        )
+                        failed_pages.append(FailedPage(url=normalized_url, reason=ROBOTS_RESTRICTED_NOTE))
+                    except Exception as exc:  # noqa: BLE001 - restricted fetch is best-effort
+                        logger.warning(
+                            f"Restricted homepage fetch failed for product_id={product_id}: {exc!r}"
+                        )
+                        failed_pages.append(
+                            FailedPage(url=normalized_url, reason=f"disallowed by robots.txt ({exc})")
+                        )
                 else:
                     try:
                         html = await _fetch_page_html(context, normalized_url)
@@ -363,8 +524,12 @@ async def crawl_website(
                             CrawledPage(url=normalized_url, role="homepage", snapshot_path=snapshot_path)
                         )
                     except Exception as exc:  # noqa: BLE001 - one bad page must not crash the crawl
-                        logger.error(f"Homepage fetch failed for product_id={product_id}: {exc!r}")
+                        logger.warning(f"Homepage fetch failed for product_id={product_id}: {exc!r}")
                         failed_pages.append(FailedPage(url=normalized_url, reason=str(exc)))
+
+                # Skip multi-page discovery when robots.txt blocked the homepage crawl.
+                if robots_blocked_homepage:
+                    nav_links = []
 
                 for role, hints in (("faq", FAQ_LINK_HINTS), ("blog", BLOG_LINK_HINTS)):
                     discovered_url = _discover_link(nav_links, hints, base_domain)
@@ -391,44 +556,45 @@ async def crawl_website(
             finally:
                 await browser.close()
     except Exception as exc:  # noqa: BLE001 - browser-level failure (e.g. blocked, crashed)
-        logger.error(f"Playwright browser failure for product_id={product_id}: {exc!r}")
-        return WebsiteCrawlOutput(
-            product_id=product_id,
-            status=IngestionStatus.FAILED,
-            error_message=f"Browser launch/navigation failure: {exc}",
-            failed_pages=[FailedPage(url=normalized_url, reason=str(exc))],
+        logger.warning(
+            f"Playwright browser failure for product_id={product_id}: {exc!r}; "
+            f"trying HTTP-only homepage fallback"
         )
+        http_result = await _try_http_homepage_only(
+            normalized_url,
+            base_domain,
+            storage_key,
+            robots_restricted=robots_blocked_homepage,
+        )
+        if http_result is not None:
+            signals = http_result["signals"]
+            title = signals["title"]
+            meta_description = signals["meta_description"]
+            last_updated_signal = signals["last_updated_signal"]
+            _merge_signals(aggregate, signals)
+            crawled_pages.append(
+                CrawledPage(
+                    url=normalized_url,
+                    role="homepage",
+                    snapshot_path=http_result["snapshot_path"],
+                )
+            )
+            if robots_blocked_homepage:
+                failed_pages.append(FailedPage(url=normalized_url, reason=ROBOTS_RESTRICTED_NOTE))
+        else:
+            failed_pages.append(FailedPage(url=normalized_url, reason=str(exc)))
 
     if not last_updated_signal:
         last_updated_signal = await _check_sitemap_lastmod(normalized_url)
 
-    if not crawled_pages:
-        status = IngestionStatus.FAILED
-        error_message: str | None = failed_pages[0].reason if failed_pages else "All pages failed to load"
-    elif failed_pages:
-        status = IngestionStatus.PARTIAL
-        error_message = None
-    else:
-        status = IngestionStatus.SUCCESS
-        error_message = None
-
-    return WebsiteCrawlOutput(
+    return _build_crawl_output(
         product_id=product_id,
-        status=status,
-        title=title,
-        meta_description=meta_description,
-        headings_summary=aggregate["headings"],
-        has_faq=aggregate["faq_count"] > 0 or "FAQPage" in aggregate["schema_types"],
-        faq_count=aggregate["faq_count"],
-        has_schema_markup=len(aggregate["schema_types"]) > 0,
-        schema_types=sorted(aggregate["schema_types"]),
-        word_count=aggregate["word_count"],
-        internal_links_count=aggregate["internal_links_count"],
-        images_missing_alt_count=aggregate["images_missing_alt_count"],
-        last_updated_signal=last_updated_signal,
         crawled_pages=crawled_pages,
         failed_pages=failed_pages,
-        error_message=error_message,
+        aggregate=aggregate,
+        title=title,
+        meta_description=meta_description,
+        last_updated_signal=last_updated_signal,
     )
 
 

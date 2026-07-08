@@ -42,7 +42,12 @@ class WebsiteCrawlerAgent(BaseAgent[WebsiteCrawlInput, WebsiteCrawlOutput]):
         finally:
             db.close()
 
-        if output.status == IngestionStatus.FAILED:
+        if output.status == IngestionStatus.PARTIAL:
+            logger.info(
+                f"[{self.name}] partial crawl for product_id={input_data.product_id} "
+                f"({len(output.crawled_pages)} page(s), {len(output.failed_pages)} skipped)"
+            )
+        elif output.status == IngestionStatus.FAILED:
             logger.warning(
                 f"[{self.name}] crawl failed for product_id={input_data.product_id}: "
                 f"{output.error_message}"

@@ -5,6 +5,17 @@ CRAWLER_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 AIGeoCopilotBot/1.0"
 )
 
+# Standard browser UA for restricted single-page fetch when robots.txt blocks
+# the identifiable bot user agent. Used only for homepage metadata extraction.
+RESTRICTED_FETCH_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+ROBOTS_RESTRICTED_NOTE = (
+    "robots.txt restricts automated crawl; limited public homepage metadata extracted"
+)
+
 NAVIGATION_TIMEOUT_MS = 20_000
 MAX_FETCH_ATTEMPTS = 3
 RETRY_BASE_DELAY_SECONDS = 1.0
